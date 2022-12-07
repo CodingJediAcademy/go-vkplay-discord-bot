@@ -22,8 +22,9 @@ import (
 const (
 	eventGuildCreate = "GUILD_CREATE"
 
-	opDispatch = 0
-	opHello    = 10
+	opDispatch   = 0
+	opHello      = 10
+	heartbeatAck = 11
 )
 
 var (
@@ -32,20 +33,20 @@ var (
 		Host:     "gateway.discord.gg",
 		RawQuery: "v=10&encoding=json",
 	}
-	heartbeatInterval = time.Duration(45) * time.Second
 )
 
 type Bot struct {
-	ctx    context.Context
-	conn   *websocket.Conn
-	token  string
-	Guilds []*model.Guild
+	ctx       context.Context
+	conn      *websocket.Conn
+	heartbeat *time.Ticker
+	token     string
+	Guilds    []*model.Guild
 }
 
 func New(
 	ctx context.Context,
 	token string,
-) Bot {
+) *Bot {
 	wssConn, _, err := websocket.DefaultDialer.DialContext(
 		ctx,
 		wssAddr.String(),
@@ -61,17 +62,30 @@ func New(
 		token: token,
 	}
 
-	return bot
+	return &bot
 }
 
-func (b Bot) Stop() {
+func (b *Bot) Run() {
+	done := make(chan struct{})
+	start := make(chan struct{})
+	messageOut := make(chan []byte)
+
+	go b.listener(done, start, messageOut)
+
+	<-start
+	go b.writer(done, messageOut)
+}
+
+func (b *Bot) Stop() {
+	b.heartbeat.Stop()
+
 	err := b.conn.Close()
 	if err != nil {
 		log.Println(err)
 	}
 }
 
-func (b Bot) SendAnnounce(
+func (b *Bot) SendAnnounce(
 	title string,
 	channelUrl url.URL,
 	viewers int,
@@ -164,28 +178,27 @@ func (b Bot) SendAnnounce(
 	return errors.New("smthing went wrong")
 }
 
-func (b Bot) Run() {
-	done := make(chan struct{})
-	messageOut := make(chan []byte)
+func (b *Bot) listener(done chan struct{}, start chan struct{}, messageOut chan []byte) {
+	defer close(done)
+	for {
+		_, message, err := b.conn.ReadMessage()
+		if err != nil {
+			log.Println("[bot] read:", err)
+			return
+		}
 
-	go func() {
-		defer close(done)
-		for {
-			_, message, err := b.conn.ReadMessage()
-			if err != nil {
-				log.Println("[bot] read:", err)
-				return
-			}
+		unmarshalledMsg := event.Payload{}
+		if err = json.Unmarshal(message, &unmarshalledMsg); err != nil {
+			log.Println("[bot] unmarshal:", err)
+		}
 
-			unmarshalledMsg := event.Payload{}
-			err = json.Unmarshal(message, &unmarshalledMsg)
-			if err != nil {
-				log.Println("[bot] unmarshal:", err)
-
-			}
-
-			//log.Printf("[bot] recv: %s", message)
-
+		switch unmarshalledMsg.OperationCode {
+		case opHello:
+			log.Println("[bot] Caught greetings.")
+			heartbeatInterval := time.Duration(int(unmarshalledMsg.Data["heartbeat_interval"].(float64)))
+			b.heartbeat = time.NewTicker(heartbeatInterval * time.Millisecond)
+			close(start)
+			log.Println("[bot] Introducing ourselves...")
 			authPayload := event.Payload{
 				OperationCode: 2,
 				Data: map[string]interface{}{
@@ -198,41 +211,40 @@ func (b Bot) Run() {
 					},
 				},
 			}
-
-			switch unmarshalledMsg.OperationCode {
-			case opHello:
-				log.Printf("[bot] Send Sub Details")
-				authMsg, err := json.Marshal(authPayload)
-				if err != nil {
-					log.Println("[bot] marshal:", err)
-				}
-				messageOut <- authMsg
-			case opDispatch:
-				if unmarshalledMsg.EventName == eventGuildCreate {
-					guild := model.Guild{}
-					data, _ := json.Marshal(unmarshalledMsg.Data)
-					_ = json.Unmarshal(data, &guild)
-					b.Guilds = append(b.Guilds, &guild)
-				}
+			authMsg, err := json.Marshal(authPayload)
+			if err != nil {
+				log.Println("[bot] marshal:", err)
 			}
+			messageOut <- authMsg
+		case opDispatch:
+			if unmarshalledMsg.EventName == eventGuildCreate {
+				guild := model.Guild{}
+				data, _ := json.Marshal(unmarshalledMsg.Data)
+				_ = json.Unmarshal(data, &guild)
+				b.Guilds = append(b.Guilds, &guild)
+			}
+		case heartbeatAck:
+			log.Printf("[bot] Catched Heartbeat ACK.")
+		default:
+			log.Printf("[bot] recv: %s", message)
 		}
-	}()
+	}
+}
 
-	heartbeat := time.NewTicker(heartbeatInterval)
-	defer heartbeat.Stop()
-
+func (b *Bot) writer(done chan struct{}, messageOut chan []byte) {
 	for {
 		select {
 		case <-done:
 			return
 		case m := <-messageOut:
-			//log.Printf("[bot] Send Message %s", string(m))
+			log.Println("[bot] Sending Message...")
 			err := b.conn.WriteMessage(websocket.TextMessage, m)
 			if err != nil {
 				log.Println("[bot] write:", err)
 				return
 			}
-		case <-heartbeat.C:
+			log.Println("[bot] Message Sent.")
+		case <-b.heartbeat.C:
 			log.Println("[bot] heart beating...")
 			err := b.conn.WriteMessage(websocket.TextMessage, []byte("{\"op\": 1,\"d\": 251}"))
 			if err != nil {

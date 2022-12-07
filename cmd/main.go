@@ -23,17 +23,18 @@ func main() {
 	defer discordCancel()
 	disBot := discord.New(discordCtx, disBotToken)
 	defer disBot.Stop()
-	go disBot.Run()
+
+	disBot.Run()
 
 	vkplayCtx, vkplayCancel := context.WithCancel(context.Background())
 	defer vkplayCancel()
-	spy := vkplay.New(vkplayCtx, vkPlayWssToken, vkPlayUserID, &disBot)
+	spy := vkplay.New(vkplayCtx, vkPlayWssToken, vkPlayUserID, disBot)
 	defer spy.Stop()
 
 	//TODO: testing
 	disChannelID := os.Getenv("disChannelID")
 	streamUrl := url.URL{Scheme: "https", Host: "vkplay.live", Path: "jedi-knight"}
-	_ = disBot.SendAnnounce(
+	err := disBot.SendAnnounce(
 		"",
 		streamUrl,
 		1,
@@ -41,6 +42,9 @@ func main() {
 		"703256781169885204",
 		disChannelID,
 	)
+	if err != nil {
+		log.Println(err)
+	}
 
 	// Waiting for term signal
 	sig := <-interrupt
@@ -51,7 +55,7 @@ func main() {
 	// TODO: close all we need
 	discordCancel()
 	vkplayCancel()
-	time.Sleep(5 * time.Second)
+	//time.Sleep(5 * time.Second)
 
 	cleanupElapsed := time.Since(cleanupStart)
 	log.Printf("cleanup completed in %v seconds\n", cleanupElapsed.Seconds())
